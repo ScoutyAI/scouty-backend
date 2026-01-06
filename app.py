@@ -7,6 +7,10 @@ from flask_cors import CORS
 import psycopg2
 
 
+# =========================
+# CONFIG
+# =========================
+
 HEADER = [
     "timestamp",
     "first_name", "last_name", "email", "company_name",
@@ -14,16 +18,22 @@ HEADER = [
     "categories", "find_suppliers", "repeat_orders", "challenge", "ai_used", "ai_tools",
     "rfqs", "rfq_frustration", "workflow_confidence", "rfq_worth", "landed_cost",
     "supplier_comm", "supplier_locations", "platforms", "ai_wish", "trust_ai",
-    "mvp_review", "follow_up", "hear_about_us"
+    "mvp_review", "follow_up", "hear_about_us",
 ]
 
+# Optional: if your frontend sends a unique ID per submission, we can hard-prevent duplicates.
 OPTIONAL_ID_FIELD = "submission_id"
 
 
 def _normalized_db_url() -> str:
+    """
+    Render Postgres often requires SSL for external connections.
+    Adding sslmode=require is safe even when internal connections work without it.
+    """
     url = os.environ.get("DATABASE_URL", "").strip()
     if not url:
         return ""
+
     if "sslmode=" not in url:
         url += ("&" if "?" in url else "?") + "sslmode=require"
     return url
@@ -38,51 +48,80 @@ def _connect():
 
 def _ensure_table():
     """
-    Idempotent schema setup + migration:
-    - Create table if missing
-    - Add missing columns if table already exists with old schema
-    - Create indexes afterwards (only after created_at exists)
+    Creates the table if it doesn't exist, and ensures index exists.
+    Safe to call repeatedly.
     """
+    create_table_sql = """
+    CREATE TABLE IF NOT EXISTS quiz_submissions (
+        id BIGSERIAL PRIMARY KEY,
+        submission_id TEXT UNIQUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+        timestamp TEXT,
+
+        first_name TEXT,
+        last_name TEXT,
+        email TEXT,
+        company_name TEXT,
+
+        phone_code TEXT,
+        phone_number TEXT,
+        job_title TEXT,
+        website TEXT,
+        linkedin_profile TEXT,
+
+        categories TEXT,
+        find_suppliers TEXT,
+        repeat_orders TEXT,
+        challenge TEXT,
+        ai_used TEXT,
+        ai_tools TEXT,
+
+        rfqs TEXT,
+        rfq_frustration TEXT,
+        workflow_confidence TEXT,
+        rfq_worth TEXT,
+        landed_cost TEXT,
+
+        supplier_comm TEXT,
+        supplier_locations TEXT,
+        platforms TEXT,
+        ai_wish TEXT,
+        trust_ai TEXT,
+
+        mvp_review TEXT,
+        follow_up TEXT,
+        hear_about_us TEXT
+    );
+    """
+
+    create_index_sql = """
+    CREATE INDEX IF NOT EXISTS idx_quiz_submissions_created_at
+    ON quiz_submissions(created_at DESC);
+    """
+
     with _connect() as conn:
         with conn.cursor() as cur:
-            # 1) Create base table (minimal)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS quiz_submissions (
-                    id BIGSERIAL PRIMARY KEY
-                );
-            """)
-
-            # 2) Add columns safely (MIGRATION)
-            cur.execute("ALTER TABLE quiz_submissions ADD COLUMN IF NOT EXISTS submission_id TEXT;")
-            cur.execute("ALTER TABLE quiz_submissions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
-            cur.execute("ALTER TABLE quiz_submissions ADD COLUMN IF NOT EXISTS timestamp TEXT;")
-
-            # Add the rest of your fields
-            for col in HEADER[1:]:
-                cur.execute(f"ALTER TABLE quiz_submissions ADD COLUMN IF NOT EXISTS {col} TEXT;")
-
-            # 3) Unique index for submission_id (dedupe only when provided)
-            cur.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS uq_quiz_submissions_submission_id
-                ON quiz_submissions(submission_id)
-                WHERE submission_id IS NOT NULL;
-            """)
-
-            # 4) Now it's safe to create created_at index
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_quiz_submissions_created_at
-                ON quiz_submissions(created_at DESC);
-            """)
-
+            cur.execute(create_table_sql)
+            cur.execute(create_index_sql)
         conn.commit()
 
 
 def create_app():
     app = Flask(__name__)
 
+    # CORS
     allowed_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
     origins = [o.strip() for o in allowed_origins.split(",")] if allowed_origins != "*" else "*"
-    CORS(app, resources={r"/*": {"origins": origins}})
+    CORS(
+        app,
+        resources={
+            r"/submit-form": {"origins": origins},
+            r"/health": {"origins": origins},
+            r"/init": {"origins": origins},
+            r"/latest": {"origins": origins},
+        },
+    )
 
     @app.route("/health", methods=["GET"])
     def health():
@@ -102,33 +141,36 @@ def create_app():
 
     @app.route("/init", methods=["GET"])
     def init():
-        # does NOT drop anything, just ensures schema exists
+        """
+        Dev/ops helper endpoint.
+        In production it is DISABLED (set ENV=production in Render env vars).
+        If enabled, it recreates the table and index.
+        """
+        if os.environ.get("ENV", "").lower() == "production":
+            return jsonify({"ok": False, "error": "init is disabled in production"}), 403
+
         _ensure_table()
         return jsonify({"ok": True, "message": "table ready", "table": "quiz_submissions"}), 200
-
-    @app.route("/reset", methods=["GET"])
-    def reset():
-        # Use this only if you want to nuke and recreate the table
-        with _connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DROP TABLE IF EXISTS quiz_submissions;")
-            conn.commit()
-
-        _ensure_table()
-        return jsonify({"ok": True, "message": "table DROPPED and recreated", "table": "quiz_submissions"}), 200
 
     @app.route("/submit-form", methods=["POST"])
     def submit_form():
         _ensure_table()
 
-        data = request.form.to_dict() if request.form else (request.get_json(silent=True) or {})
+        # Accept either form-encoded or JSON payloads
+        if request.form:
+            data = request.form.to_dict()
+        else:
+            data = request.get_json(silent=True) or {}
 
-        # Optional honeypot
+        # Honeypot / anti-spam support (if your HTML sends it)
         honeypot = (data.get("website_hp") or data.get("hp") or "").strip()
         if honeypot:
             return jsonify({"message": "ok"}), 200
 
+        # Timestamp (keep your previous behavior)
         timestamp_str = data.get("timestamp") or (datetime.utcnow().isoformat() + "Z")
+
+        # Optional: strict dedupe if client sends submission_id
         submission_id = (data.get(OPTIONAL_ID_FIELD) or "").strip() or None
 
         cols = ["submission_id", "timestamp"] + HEADER[1:]
@@ -140,7 +182,7 @@ def create_app():
         sql = f"""
             INSERT INTO quiz_submissions ({col_list})
             VALUES ({placeholders})
-            ON CONFLICT DO NOTHING;
+            ON CONFLICT (submission_id) DO NOTHING;
         """
 
         with _connect() as conn:
@@ -149,6 +191,57 @@ def create_app():
             conn.commit()
 
         return jsonify({"message": "ok"}), 200
+
+    @app.route("/latest", methods=["GET"])
+    def latest():
+        """
+        Quick sanity-check endpoint: returns the most recent submission.
+        Protect it with a simple token if you want (optional):
+          - Set env var LATEST_TOKEN, then call /latest?token=...
+        """
+        token_required = os.environ.get("LATEST_TOKEN", "").strip()
+        if token_required:
+            token = (request.args.get("token") or "").strip()
+            if token != token_required:
+                return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+        _ensure_table()
+
+        sql = """
+            SELECT
+                id,
+                submission_id,
+                created_at,
+                timestamp,
+                first_name,
+                last_name,
+                email,
+                company_name
+            FROM quiz_submissions
+            ORDER BY created_at DESC
+            LIMIT 1;
+        """
+
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                row = cur.fetchone()
+
+        if not row:
+            return jsonify({"ok": True, "latest": None}), 200
+
+        latest_row = {
+            "id": row[0],
+            "submission_id": row[1],
+            "created_at": row[2].isoformat() if row[2] else None,
+            "timestamp": row[3],
+            "first_name": row[4],
+            "last_name": row[5],
+            "email": row[6],
+            "company_name": row[7],
+        }
+
+        return jsonify({"ok": True, "latest": latest_row}), 200
 
     return app
 
