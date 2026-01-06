@@ -1,10 +1,12 @@
 import os
+import json
 from datetime import datetime
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 import psycopg2
+from psycopg2.extras import Json
 
 
 # =========================
@@ -21,7 +23,6 @@ HEADER = [
     "mvp_review", "follow_up", "hear_about_us",
 ]
 
-# Optional: if your frontend sends a unique ID per submission, we can hard-prevent duplicates.
 OPTIONAL_ID_FIELD = "submission_id"
 
 
@@ -33,7 +34,6 @@ def _normalized_db_url() -> str:
     url = os.environ.get("DATABASE_URL", "").strip()
     if not url:
         return ""
-
     if "sslmode=" not in url:
         url += ("&" if "?" in url else "?") + "sslmode=require"
     return url
@@ -49,6 +49,7 @@ def _connect():
 def _ensure_table():
     """
     Creates the table if it doesn't exist, and ensures index exists.
+    Also creates raw_payload JSONB column to store full submission payload.
     Safe to call repeatedly.
     """
     create_table_sql = """
@@ -91,7 +92,9 @@ def _ensure_table():
 
         mvp_review TEXT,
         follow_up TEXT,
-        hear_about_us TEXT
+        hear_about_us TEXT,
+
+        raw_payload JSONB
     );
     """
 
@@ -107,6 +110,56 @@ def _ensure_table():
         conn.commit()
 
 
+def _log_request_summary(prefix: str = "REQ"):
+    """
+    Logs what actually reached Flask. Check Render logs.
+    """
+    try:
+        raw = request.get_data(cache=True) or b""
+        print(
+            f"{prefix} path={request.path} "
+            f"ct={request.content_type} "
+            f"len={len(raw)} "
+            f"form_keys={list(request.form.keys())} "
+            f"args_keys={list(request.args.keys())}"
+        )
+    except Exception as e:
+        print(f"{prefix} logging_error={e}")
+
+
+def _read_payload() -> tuple[dict, str]:
+    """
+    Robustly read payload from:
+      - multipart/form-data (FormData)
+      - application/x-www-form-urlencoded
+      - application/json
+      - fallback: try parse raw body as JSON
+    Returns: (data_dict, mode)
+    """
+    # 1) Form fields (works for multipart/form-data and x-www-form-urlencoded)
+    if request.form and len(request.form.keys()) > 0:
+        return request.form.to_dict(flat=True), "form"
+
+    # 2) JSON body (fetch with Content-Type: application/json)
+    js = request.get_json(silent=True)
+    if isinstance(js, dict) and js:
+        return js, "json"
+
+    # 3) Fallback: raw body parse as JSON (some clients forget headers)
+    raw = (request.get_data(cache=True) or b"").decode("utf-8", errors="ignore").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed, "raw_json"
+            return {"_raw": raw, "_parsed_non_dict": parsed}, "raw_non_dict"
+        except Exception:
+            return {"_raw": raw}, "raw_text"
+
+    # 4) Nothing received
+    return {}, "empty"
+
+
 def create_app():
     app = Flask(__name__)
 
@@ -120,6 +173,7 @@ def create_app():
             r"/health": {"origins": origins},
             r"/init": {"origins": origins},
             r"/latest": {"origins": origins},
+            r"/debug-receive": {"origins": origins},
         },
     )
 
@@ -144,7 +198,7 @@ def create_app():
         """
         Dev/ops helper endpoint.
         In production it is DISABLED (set ENV=production in Render env vars).
-        If enabled, it recreates the table and index.
+        If enabled, it ensures table exists (does NOT drop rows).
         """
         if os.environ.get("ENV", "").lower() == "production":
             return jsonify({"ok": False, "error": "init is disabled in production"}), 403
@@ -152,45 +206,83 @@ def create_app():
         _ensure_table()
         return jsonify({"ok": True, "message": "table ready", "table": "quiz_submissions"}), 200
 
+    @app.route("/debug-receive", methods=["POST"])
+    def debug_receive():
+        """
+        Debug endpoint to see exactly what Flask receives.
+        Call it from your frontend temporarily if needed.
+        """
+        _log_request_summary("DEBUG")
+        data, mode = _read_payload()
+        return jsonify({
+            "ok": True,
+            "mode": mode,
+            "content_type": request.content_type,
+            "form_keys": list(request.form.keys()),
+            "json_present": isinstance(request.get_json(silent=True), dict),
+            "raw_len": len(request.get_data(cache=True) or b""),
+            "received_keys": list(data.keys()),
+            "received_sample": {k: data.get(k) for k in list(data.keys())[:10]},
+        }), 200
+
     @app.route("/submit-form", methods=["POST"])
     def submit_form():
         _ensure_table()
 
-        # Accept either form-encoded or JSON payloads
-        if request.form:
-            data = request.form.to_dict()
-        else:
-            data = request.get_json(silent=True) or {}
+        _log_request_summary("SUBMIT")
+        data, mode = _read_payload()
 
         # Honeypot / anti-spam support (if your HTML sends it)
         honeypot = (data.get("website_hp") or data.get("hp") or "").strip()
         if honeypot:
             return jsonify({"message": "ok"}), 200
 
+        # If we literally received nothing, return an error so you notice.
+        # (If you prefer silent success, change to 200.)
+        if not data:
+            return jsonify({
+                "ok": False,
+                "error": "empty_payload",
+                "hint": "Your frontend is not sending fields (often missing name=..., disabled inputs, or wrong Content-Type).",
+                "content_type": request.content_type,
+                "mode": mode,
+            }), 400
+
         # Timestamp (keep your previous behavior)
-        timestamp_str = data.get("timestamp") or (datetime.utcnow().isoformat() + "Z")
+        timestamp_str = (data.get("timestamp") or "").strip() or (datetime.utcnow().isoformat() + "Z")
 
         # Optional: strict dedupe if client sends submission_id
         submission_id = (data.get(OPTIONAL_ID_FIELD) or "").strip() or None
 
-        cols = ["submission_id", "timestamp"] + HEADER[1:]
-        values = [submission_id, timestamp_str] + [data.get(k, "") for k in HEADER[1:]]
+        # Map known columns
+        cols = ["submission_id", "timestamp"] + HEADER[1:] + ["raw_payload"]
+        values = [submission_id, timestamp_str] + [data.get(k, "") for k in HEADER[1:]] + [Json(data)]
 
         placeholders = ", ".join(["%s"] * len(cols))
         col_list = ", ".join(cols)
 
-        sql = f"""
-            INSERT INTO quiz_submissions ({col_list})
-            VALUES ({placeholders})
-            ON CONFLICT (submission_id) DO NOTHING;
-        """
+        # IMPORTANT:
+        # Only apply ON CONFLICT if submission_id is present.
+        # If submission_id is None, the unique constraint doesn't conflict, but this logic is clearer
+        # and prevents "accidental do-nothing" behavior if you later change how submission_id is sent.
+        if submission_id:
+            sql = f"""
+                INSERT INTO quiz_submissions ({col_list})
+                VALUES ({placeholders})
+                ON CONFLICT (submission_id) DO NOTHING;
+            """
+        else:
+            sql = f"""
+                INSERT INTO quiz_submissions ({col_list})
+                VALUES ({placeholders});
+            """
 
         with _connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, values)
             conn.commit()
 
-        return jsonify({"message": "ok"}), 200
+        return jsonify({"message": "ok", "mode": mode, "received_keys": len(data.keys())}), 200
 
     @app.route("/latest", methods=["GET"])
     def latest():
@@ -216,7 +308,8 @@ def create_app():
                 first_name,
                 last_name,
                 email,
-                company_name
+                company_name,
+                raw_payload
             FROM quiz_submissions
             ORDER BY created_at DESC
             LIMIT 1;
@@ -239,6 +332,7 @@ def create_app():
             "last_name": row[5],
             "email": row[6],
             "company_name": row[7],
+            "raw_payload": row[8],  # helpful for debugging what arrived
         }
 
         return jsonify({"ok": True, "latest": latest_row}), 200
