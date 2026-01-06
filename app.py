@@ -233,9 +233,9 @@ def create_app():
         data, mode = _read_payload()
 
         # Honeypot / anti-spam support (if your HTML sends it)
-        honeypot = (data.get("website_hp") or data.get("hp") or "").strip()
-        if honeypot:
-            return jsonify({"message": "ok"}), 200
+        # honeypot = (data.get("website_hp") or data.get("hp") or "").strip()
+        # if honeypot:
+        #    return jsonify({"message": "ok"}), 200
 
         # If we literally received nothing, return an error so you notice.
         # (If you prefer silent success, change to 200.)
