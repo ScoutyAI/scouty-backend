@@ -7,10 +7,6 @@ from flask_cors import CORS
 import psycopg2
 
 
-# =========================
-# CONFIG
-# =========================
-
 HEADER = [
     "timestamp",
     "first_name", "last_name", "email", "company_name",
@@ -21,19 +17,13 @@ HEADER = [
     "mvp_review", "follow_up", "hear_about_us"
 ]
 
-# Optional: if your frontend sends a unique ID per submission, we can prevent duplicates.
 OPTIONAL_ID_FIELD = "submission_id"
 
 
 def _normalized_db_url() -> str:
-    """
-    Render Postgres connections commonly require SSL for external connections.
-    Adding sslmode=require is safe.
-    """
     url = os.environ.get("DATABASE_URL", "").strip()
     if not url:
         return ""
-
     if "sslmode=" not in url:
         url += ("&" if "?" in url else "?") + "sslmode=require"
     return url
@@ -48,87 +38,57 @@ def _connect():
 
 def _ensure_table():
     """
-    Creates the table + index if they don't exist.
-    Called by /init and /submit-form so the app always self-heals.
+    Idempotent schema setup + migration:
+    - Create table if missing
+    - Add missing columns if table already exists with old schema
+    - Create indexes afterwards (only after created_at exists)
     """
-
-    create_table_sql = """
-    CREATE TABLE IF NOT EXISTS quiz_submissions (
-        id BIGSERIAL PRIMARY KEY,
-        submission_id TEXT UNIQUE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-        timestamp TEXT,
-
-        first_name TEXT,
-        last_name TEXT,
-        email TEXT,
-        company_name TEXT,
-
-        phone_code TEXT,
-        phone_number TEXT,
-        job_title TEXT,
-        website TEXT,
-        linkedin_profile TEXT,
-
-        categories TEXT,
-        find_suppliers TEXT,
-        repeat_orders TEXT,
-        challenge TEXT,
-        ai_used TEXT,
-        ai_tools TEXT,
-
-        rfqs TEXT,
-        rfq_frustration TEXT,
-        workflow_confidence TEXT,
-        rfq_worth TEXT,
-        landed_cost TEXT,
-
-        supplier_comm TEXT,
-        supplier_locations TEXT,
-        platforms TEXT,
-        ai_wish TEXT,
-        trust_ai TEXT,
-
-        mvp_review TEXT,
-        follow_up TEXT,
-        hear_about_us TEXT
-    );
-    """
-
-    create_index_sql = """
-    CREATE INDEX IF NOT EXISTS idx_quiz_submissions_created_at
-    ON quiz_submissions(created_at DESC);
-    """
-
     with _connect() as conn:
         with conn.cursor() as cur:
-            cur.execute(create_table_sql)
-            cur.execute(create_index_sql)
+            # 1) Create base table (minimal)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS quiz_submissions (
+                    id BIGSERIAL PRIMARY KEY
+                );
+            """)
+
+            # 2) Add columns safely (MIGRATION)
+            cur.execute("ALTER TABLE quiz_submissions ADD COLUMN IF NOT EXISTS submission_id TEXT;")
+            cur.execute("ALTER TABLE quiz_submissions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
+            cur.execute("ALTER TABLE quiz_submissions ADD COLUMN IF NOT EXISTS timestamp TEXT;")
+
+            # Add the rest of your fields
+            for col in HEADER[1:]:
+                cur.execute(f"ALTER TABLE quiz_submissions ADD COLUMN IF NOT EXISTS {col} TEXT;")
+
+            # 3) Unique index for submission_id (dedupe only when provided)
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_quiz_submissions_submission_id
+                ON quiz_submissions(submission_id)
+                WHERE submission_id IS NOT NULL;
+            """)
+
+            # 4) Now it's safe to create created_at index
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_quiz_submissions_created_at
+                ON quiz_submissions(created_at DESC);
+            """)
+
         conn.commit()
 
 
 def create_app():
     app = Flask(__name__)
 
-    # CORS
     allowed_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
     origins = [o.strip() for o in allowed_origins.split(",")] if allowed_origins != "*" else "*"
-    CORS(
-        app,
-        resources={
-            r"/submit-form": {"origins": origins},
-            r"/health": {"origins": origins},
-            r"/init": {"origins": origins},
-            r"/reset": {"origins": origins},
-        },
-    )
+    CORS(app, resources={r"/*": {"origins": origins}})
 
     @app.route("/health", methods=["GET"])
     def health():
         db_url_present = bool(os.environ.get("DATABASE_URL", "").strip())
-
         db_ok = False
+
         if db_url_present:
             try:
                 with _connect() as conn:
@@ -142,51 +102,28 @@ def create_app():
 
     @app.route("/init", methods=["GET"])
     def init():
-        """
-        SAFE init: does NOT delete data.
-        It only ensures the table exists (and index exists).
-        """
+        # does NOT drop anything, just ensures schema exists
         _ensure_table()
         return jsonify({"ok": True, "message": "table ready", "table": "quiz_submissions"}), 200
 
-    @app.route("/reset", methods=["POST"])
+    @app.route("/reset", methods=["GET"])
     def reset():
-        """
-        DANGEROUS: drops the table then recreates it.
-        Protected by a secret so random visitors can't wipe your DB.
-
-        Set env var: RESET_TOKEN = some-long-random-string
-        Then call:
-          POST /reset
-          Header: X-Reset-Token: <RESET_TOKEN>
-        """
-        expected = os.environ.get("RESET_TOKEN", "").strip()
-        provided = request.headers.get("X-Reset-Token", "").strip()
-
-        if not expected:
-            return jsonify({"ok": False, "error": "RESET_TOKEN is not set on server"}), 400
-        if provided != expected:
-            return jsonify({"ok": False, "error": "Unauthorized"}), 401
-
+        # Use this only if you want to nuke and recreate the table
         with _connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("DROP TABLE IF EXISTS quiz_submissions;")
             conn.commit()
 
         _ensure_table()
-        return jsonify({"ok": True, "message": "table reset and ready", "table": "quiz_submissions"}), 200
+        return jsonify({"ok": True, "message": "table DROPPED and recreated", "table": "quiz_submissions"}), 200
 
     @app.route("/submit-form", methods=["POST"])
     def submit_form():
         _ensure_table()
 
-        # Accept either form-encoded or JSON payloads
-        if request.form:
-            data = request.form.to_dict()
-        else:
-            data = request.get_json(silent=True) or {}
+        data = request.form.to_dict() if request.form else (request.get_json(silent=True) or {})
 
-        # Optional honeypot for bots (if your HTML sends it)
+        # Optional honeypot
         honeypot = (data.get("website_hp") or data.get("hp") or "").strip()
         if honeypot:
             return jsonify({"message": "ok"}), 200
@@ -203,7 +140,7 @@ def create_app():
         sql = f"""
             INSERT INTO quiz_submissions ({col_list})
             VALUES ({placeholders})
-            ON CONFLICT (submission_id) DO NOTHING;
+            ON CONFLICT DO NOTHING;
         """
 
         with _connect() as conn:
