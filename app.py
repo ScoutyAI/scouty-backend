@@ -1,9 +1,10 @@
 import os
 from datetime import datetime
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+
 import psycopg2
-import psycopg2.extras
 
 
 # =========================
@@ -20,21 +21,19 @@ HEADER = [
     "mvp_review", "follow_up", "hear_about_us"
 ]
 
-# Optional: if your frontend sends a unique ID per submission, we can hard-prevent duplicates.
-# (If it is not sent, everything still works.)
+# Optional: if your frontend sends a unique ID per submission, we can prevent duplicates.
 OPTIONAL_ID_FIELD = "submission_id"
 
 
 def _normalized_db_url() -> str:
     """
-    Render Postgres often requires SSL for external connections.
-    Adding sslmode=require is safe even when internal connections work without it.
+    Render Postgres connections commonly require SSL for external connections.
+    Adding sslmode=require is safe.
     """
     url = os.environ.get("DATABASE_URL", "").strip()
     if not url:
         return ""
 
-    # If user pasted an internal URL, it might not have sslmode.
     if "sslmode=" not in url:
         url += ("&" if "?" in url else "?") + "sslmode=require"
     return url
@@ -49,10 +48,11 @@ def _connect():
 
 def _ensure_table():
     """
-    Creates the table if it doesn't exist.
-    Called by /init and also by /submit-form (so it never breaks).
+    Creates the table + index if they don't exist.
+    Called by /init and /submit-form so the app always self-heals.
     """
-    ddl = """
+
+    create_table_sql = """
     CREATE TABLE IF NOT EXISTS quiz_submissions (
         id BIGSERIAL PRIMARY KEY,
         submission_id TEXT UNIQUE,
@@ -94,27 +94,40 @@ def _ensure_table():
         follow_up TEXT,
         hear_about_us TEXT
     );
+    """
 
+    create_index_sql = """
     CREATE INDEX IF NOT EXISTS idx_quiz_submissions_created_at
     ON quiz_submissions(created_at DESC);
     """
+
     with _connect() as conn:
         with conn.cursor() as cur:
-            cur.execute(ddl)
+            cur.execute(create_table_sql)
+            cur.execute(create_index_sql)
         conn.commit()
 
 
 def create_app():
     app = Flask(__name__)
 
+    # CORS
     allowed_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
     origins = [o.strip() for o in allowed_origins.split(",")] if allowed_origins != "*" else "*"
-    CORS(app, resources={r"/submit-form": {"origins": origins}, r"/health": {"origins": origins}, r"/init": {"origins": origins}})
+    CORS(
+        app,
+        resources={
+            r"/submit-form": {"origins": origins},
+            r"/health": {"origins": origins},
+            r"/init": {"origins": origins},
+            r"/reset": {"origins": origins},
+        },
+    )
 
     @app.route("/health", methods=["GET"])
     def health():
         db_url_present = bool(os.environ.get("DATABASE_URL", "").strip())
-        # Optional quick DB ping (safe)
+
         db_ok = False
         if db_url_present:
             try:
@@ -129,8 +142,39 @@ def create_app():
 
     @app.route("/init", methods=["GET"])
     def init():
+        """
+        SAFE init: does NOT delete data.
+        It only ensures the table exists (and index exists).
+        """
         _ensure_table()
         return jsonify({"ok": True, "message": "table ready", "table": "quiz_submissions"}), 200
+
+    @app.route("/reset", methods=["POST"])
+    def reset():
+        """
+        DANGEROUS: drops the table then recreates it.
+        Protected by a secret so random visitors can't wipe your DB.
+
+        Set env var: RESET_TOKEN = some-long-random-string
+        Then call:
+          POST /reset
+          Header: X-Reset-Token: <RESET_TOKEN>
+        """
+        expected = os.environ.get("RESET_TOKEN", "").strip()
+        provided = request.headers.get("X-Reset-Token", "").strip()
+
+        if not expected:
+            return jsonify({"ok": False, "error": "RESET_TOKEN is not set on server"}), 400
+        if provided != expected:
+            return jsonify({"ok": False, "error": "Unauthorized"}), 401
+
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DROP TABLE IF EXISTS quiz_submissions;")
+            conn.commit()
+
+        _ensure_table()
+        return jsonify({"ok": True, "message": "table reset and ready", "table": "quiz_submissions"}), 200
 
     @app.route("/submit-form", methods=["POST"])
     def submit_form():
@@ -142,29 +186,20 @@ def create_app():
         else:
             data = request.get_json(silent=True) or {}
 
-        # Honeypot / anti-spam support (if your HTML sends it)
-        # If your HTML uses a different name, change this to match.
+        # Optional honeypot for bots (if your HTML sends it)
         honeypot = (data.get("website_hp") or data.get("hp") or "").strip()
         if honeypot:
-            # Pretend it's ok so bots don't learn
             return jsonify({"message": "ok"}), 200
 
-        # Use your original timestamp format (string) but also store server time.
-        # Keep timestamp as ISO string in DB to match your previous CSV approach.
         timestamp_str = data.get("timestamp") or (datetime.utcnow().isoformat() + "Z")
-
-        # Optional: strict dedupe if client sends submission_id
         submission_id = (data.get(OPTIONAL_ID_FIELD) or "").strip() or None
 
-        # Prepare insert
         cols = ["submission_id", "timestamp"] + HEADER[1:]
         values = [submission_id, timestamp_str] + [data.get(k, "") for k in HEADER[1:]]
 
         placeholders = ", ".join(["%s"] * len(cols))
         col_list = ", ".join(cols)
 
-        # If submission_id is present: ON CONFLICT DO NOTHING prevents duplicate submissions completely.
-        # If it's null: Postgres allows multiple NULLs in UNIQUE column, so normal inserts work.
         sql = f"""
             INSERT INTO quiz_submissions ({col_list})
             VALUES ({placeholders})
